@@ -26,5 +26,17 @@
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},
 
     "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "bierner.markdown-mermaid",
+        "rust-lang.rust-analyzer",
+        "GitHub.copilot",
+        "GitHub.copilot-chat",
+        "vadimcn.vscode-lldb"
+      ]
+    },
+    "postCreateCommand": "cargo install just"
   }
 }
