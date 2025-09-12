@@ -12,14 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "postgres")]
 use bytes::Bytes;
+
+#[cfg(feature = "postgres")]
 use common::{
     CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string,
     heartbeat, init_tracing, join_group, offset_fetch, register_broker, storage_container,
     sync_group,
 };
+
+#[cfg(feature = "postgres")]
 use rand::{prelude::*, rng};
+
+#[cfg(feature = "postgres")]
 use tansu_broker::{Result, coordinator::group::administrator::Controller};
+
+#[cfg(feature = "postgres")]
 use tansu_sans_io::{
     BatchAttribute, ErrorCode, HeartbeatResponse, IsolationLevel, OffsetFetchResponse,
     add_partitions_to_txn_request::AddPartitionsToTxnTopic,
@@ -33,17 +42,26 @@ use tansu_sans_io::{
     txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
-use tansu_storage::{
-    ListOffsetRequest, Storage, Topition, TxnAddPartitionsRequest, TxnOffsetCommitRequest,
-};
+
+#[cfg(feature = "postgres")]
+use tansu_storage::{Storage, Topition, TxnAddPartitionsRequest, TxnOffsetCommitRequest};
+
+#[cfg(feature = "postgres")]
 use tracing::debug;
+
+#[cfg(feature = "postgres")]
 use url::Url;
+
+#[cfg(feature = "postgres")]
 use uuid::Uuid;
 
 mod common;
 
+#[cfg(feature = "postgres")]
 #[tokio::test]
 async fn simple_txn_commit() -> Result<()> {
+    use tansu_sans_io::ListOffset;
+
     let _guard = init_tracing()?;
 
     let mut rng = rng();
@@ -51,19 +69,16 @@ async fn simple_txn_commit() -> Result<()> {
     let cluster_id = Uuid::now_v7();
     let broker_id = rng.random_range(0..i32::MAX);
 
-    let mut sc = Url::parse("tcp://127.0.0.1/")
-        .map_err(Into::into)
-        .and_then(|advertised_listener| {
-            storage_container(
-                StorageType::Postgres,
-                cluster_id,
-                broker_id,
-                advertised_listener,
-                None,
-            )
-        })?;
+    let mut sc = storage_container(
+        StorageType::Postgres,
+        cluster_id,
+        broker_id,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await?;
 
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let input_topic_name: String = alphanumeric_string(15);
     debug!(?input_topic_name);
@@ -386,7 +401,7 @@ async fn simple_txn_commit() -> Result<()> {
     let list_offsets_before_produce = sc
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(output_topition.clone(), ListOffsetRequest::Latest)],
+            &[(output_topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, list_offsets_before_produce.len());
@@ -423,7 +438,7 @@ async fn simple_txn_commit() -> Result<()> {
     let list_offsets_after_produce = sc
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(output_topition.clone(), ListOffsetRequest::Latest)],
+            &[(output_topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, list_offsets_after_produce.len());
@@ -440,7 +455,7 @@ async fn simple_txn_commit() -> Result<()> {
     let list_offsets_after_produce = sc
         .list_offsets(
             IsolationLevel::ReadCommitted,
-            &[(output_topition.clone(), ListOffsetRequest::Latest)],
+            &[(output_topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, list_offsets_after_produce.len());
@@ -499,7 +514,7 @@ async fn simple_txn_commit() -> Result<()> {
     let list_offsets_after_produce = sc
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(output_topition.clone(), ListOffsetRequest::Latest)],
+            &[(output_topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, list_offsets_after_produce.len());
@@ -517,7 +532,7 @@ async fn simple_txn_commit() -> Result<()> {
     let list_offsets_after_produce = sc
         .list_offsets(
             IsolationLevel::ReadCommitted,
-            &[(output_topition.clone(), ListOffsetRequest::Latest)],
+            &[(output_topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, list_offsets_after_produce.len());

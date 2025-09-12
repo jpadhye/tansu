@@ -20,15 +20,14 @@
 //! contains a list of fields together with their associated type. Each field can
 //! include a range of versions for which it is valid, its encoding and whether it
 //! includes tagged fields. Further background on the protocol and implementation
-//! used are in the [`serde-kafka-protocol`] article.
+//! used are in the
+//! [Apache Kafka protocol with serde, quote, syn and proc_macro2](https://blog.tansu.io/articles/serde-kafka-protocol)
+//! article.
 //!
 //! Some useful starting points:
 //!
-//! - **Data Structures** - The key structures are: [`Frame`], [`Header`] and [`Body`].
+//! - **Data Structures** - [`Frame`], [`Request`], [`Response`], [`Header`] and [`Body`].
 //! - **Producing or fetching messages** - [`record`], [`ProduceRequest`] and [`FetchRequest`]
-//!
-//! [`serde-kafka-protocol`]: https://blog.tansu.io/articles/serde-kafka-protocol
-//! [`serde-data-model`]: https://serde.rs/data-model.html
 //!
 //! ## Examples
 //!
@@ -115,7 +114,7 @@
 //! The Kafka protocol is implemented by [`ser::Encoder`] and [`de::Decoder`],
 //! using [`MESSAGE_META`] to determine which fields are present, their serialization type
 //! and whether any tagged fields can be present for a particular message version. Serializers
-//! map from the [`serde-data-model`] to the Kafka protocol or vice versa.
+//! map from the [Serde Data Model](https://serde.rs/data-model.html) to the Kafka protocol or vice versa.
 
 pub mod de;
 pub mod primitive;
@@ -138,7 +137,7 @@ use std::{
     num,
     process::{ExitCode, Termination},
     str, string,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, SystemTimeError},
 };
 use tansu_model::{MessageKind, MessageMeta};
@@ -199,7 +198,25 @@ pub trait ApiKey {
     const KEY: i16;
 }
 
-#[derive(Debug, thiserror::Error)]
+pub trait ApiName {
+    const NAME: &'static str;
+}
+
+/// All Kafka API requests implement this trait
+pub trait Request:
+    ApiKey + ApiName + fmt::Debug + Default + Into<Body> + Send + Sync + TryFrom<Body> + 'static
+{
+    type Response: Response;
+}
+
+/// All Kafka API responses implement this trait
+pub trait Response:
+    ApiKey + ApiName + fmt::Debug + Default + Into<Body> + Send + Sync + TryFrom<Body> + 'static
+{
+    type Request: Request;
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     ApiError(ErrorCode),
     EnvVar(VarError),
@@ -208,12 +225,13 @@ pub enum Error {
     InvalidCoordinatorType(i8),
     InvalidIsolationLevel(i8),
     InvalidOpType(i8),
-    Io(io::Error),
+    Io(Arc<io::Error>),
     Message(String),
     NoSuchField(&'static str),
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
-    ParseFilter(#[from] ParseError),
+    ParseFilter(Arc<ParseError>),
+    ResponseFrame,
     Snap(#[from] snap::Error),
     StringWithoutApiVersion,
     StringWithoutLength,
@@ -252,7 +270,13 @@ impl serde::de::Error for Error {
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        Self::Io(value)
+        Self::Io(Arc::new(value))
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(value: ParseError) -> Self {
+        Self::ParseFilter(Arc::new(value))
     }
 }
 
@@ -433,6 +457,47 @@ impl Frame {
         let mut reader = bytes.reader();
         let mut deserializer = Decoder::response(&mut reader, api_key, api_version);
         Frame::deserialize(&mut deserializer)
+    }
+
+    /// API request key
+    pub fn api_key(&self) -> Result<i16> {
+        if let Header::Request { api_key, .. } = self.header {
+            Ok(api_key)
+        } else {
+            Err(Error::ResponseFrame)
+        }
+    }
+
+    /// API name
+    pub fn api_name(&self) -> &str {
+        self.body.api_name()
+    }
+
+    /// API request version
+    pub fn api_version(&self) -> Result<i16> {
+        if let Header::Request { api_version, .. } = self.header {
+            Ok(api_version)
+        } else {
+            Err(Error::ResponseFrame)
+        }
+    }
+
+    /// API request/response correlation ID
+    pub fn correlation_id(&self) -> Result<i32> {
+        match self.header {
+            Header::Request { correlation_id, .. } | Header::Response { correlation_id } => {
+                Ok(correlation_id)
+            }
+        }
+    }
+
+    /// API request client ID
+    pub fn client_id(&self) -> Result<Option<&str>> {
+        if let Header::Request { ref client_id, .. } = self.header {
+            Ok(client_id.as_deref())
+        } else {
+            Err(Error::ResponseFrame)
+        }
     }
 }
 
@@ -1903,6 +1968,46 @@ pub fn to_timestamp(system_time: SystemTime) -> Result<i64> {
         .map_err(Into::into)
         .map(|since_epoch| since_epoch.as_millis())
         .and_then(|since_epoch| i64::try_from(since_epoch).map_err(Into::into))
+}
+
+/// List Offset
+///
+/// An enumeration of offset request types, with conversion from/to an i64 protocol representation.
+///
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ListOffset {
+    Earliest,
+    Latest,
+    Timestamp(SystemTime),
+}
+
+impl ListOffset {
+    const EARLIEST_OFFSET: i64 = -2;
+    const LATEST_OFFSET: i64 = -1;
+}
+
+impl TryFrom<ListOffset> for i64 {
+    type Error = Error;
+
+    fn try_from(value: ListOffset) -> Result<Self, Self::Error> {
+        match value {
+            ListOffset::Earliest => Ok(ListOffset::EARLIEST_OFFSET),
+            ListOffset::Latest => Ok(ListOffset::LATEST_OFFSET),
+            ListOffset::Timestamp(timestamp) => to_timestamp(timestamp),
+        }
+    }
+}
+
+impl TryFrom<i64> for ListOffset {
+    type Error = Error;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            Self::EARLIEST_OFFSET => Ok(Self::Earliest),
+            Self::LATEST_OFFSET => Ok(Self::Latest),
+            timestamp => to_system_time(timestamp).map(Self::Timestamp),
+        }
+    }
 }
 
 #[cfg(test)]

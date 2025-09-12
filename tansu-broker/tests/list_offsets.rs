@@ -17,19 +17,23 @@ use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
 use rand::{prelude::*, rng};
 use tansu_broker::Result;
 use tansu_sans_io::{
-    IsolationLevel,
+    IsolationLevel, ListOffset,
     create_topics_request::CreatableTopic,
     record::{Record, inflated},
 };
-use tansu_storage::{ListOffsetRequest, Storage, StorageContainer, Topition};
+use tansu_storage::{Storage, StorageContainer, Topition};
 use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
 pub mod common;
 
-pub async fn new_topic(cluster_id: Uuid, broker_id: i32, mut sc: StorageContainer) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+pub async fn new_topic(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    mut sc: StorageContainer,
+) -> Result<()> {
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -56,15 +60,18 @@ pub async fn new_topic(cluster_id: Uuid, broker_id: i32, mut sc: StorageContaine
         .map(|partition| {
             (
                 Topition::new(topic_name.clone(), partition),
-                ListOffsetRequest::Latest,
+                ListOffset::Latest,
             )
         })
         .collect::<Vec<_>>();
 
-    for (_toptition, response) in sc
+    let items = sc
         .list_offsets(IsolationLevel::ReadUncommitted, &offsets[..])
-        .await?
-    {
+        .await?;
+
+    assert!(!items.is_empty());
+
+    for (_toptition, response) in items {
         assert_eq!(Some(0), response.offset);
         assert_eq!(None, response.timestamp);
     }
@@ -73,11 +80,11 @@ pub async fn new_topic(cluster_id: Uuid, broker_id: i32, mut sc: StorageContaine
 }
 
 pub async fn single_record(
-    cluster_id: Uuid,
+    cluster_id: impl Into<String>,
     broker_id: i32,
     mut sc: StorageContainer,
 ) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -118,7 +125,7 @@ pub async fn single_record(
             .inspect(|offset| debug!(?offset))?
     );
 
-    let offsets = [(topition.clone(), ListOffsetRequest::Latest)];
+    let offsets = [(topition.clone(), ListOffset::Latest)];
 
     let responses = sc
         .list_offsets(IsolationLevel::ReadUncommitted, &offsets[..])
@@ -130,21 +137,19 @@ pub async fn single_record(
     Ok(())
 }
 
+#[cfg(feature = "postgres")]
 mod pg {
     use super::*;
 
-    fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
-        Url::parse("tcp://127.0.0.1/")
-            .map_err(Into::into)
-            .and_then(|advertised_listener| {
-                common::storage_container(
-                    StorageType::Postgres,
-                    cluster,
-                    node,
-                    advertised_listener,
-                    None,
-                )
-            })
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::Postgres,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -157,7 +162,7 @@ mod pg {
         super::new_topic(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -172,7 +177,7 @@ mod pg {
         super::single_record(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -181,18 +186,15 @@ mod pg {
 mod in_memory {
     use super::*;
 
-    fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
-        Url::parse("tcp://127.0.0.1/")
-            .map_err(Into::into)
-            .and_then(|advertised_listener| {
-                common::storage_container(
-                    StorageType::InMemory,
-                    cluster,
-                    node,
-                    advertised_listener,
-                    None,
-                )
-            })
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::InMemory,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -205,7 +207,7 @@ mod in_memory {
         super::new_topic(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -220,7 +222,53 @@ mod in_memory {
         super::single_record(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::Lite,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn new_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::new_topic(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn single_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::single_record(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }

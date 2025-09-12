@@ -16,23 +16,27 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
+use rama::{Context, Service};
 use rand::{prelude::*, rng};
-use tansu_broker::{Result, broker::fetch::FetchRequest};
+use tansu_broker::Result;
 use tansu_sans_io::{
-    ErrorCode, FetchResponse, IsolationLevel, NULL_TOPIC_ID,
+    ErrorCode, FetchRequest, IsolationLevel, ListOffset, NULL_TOPIC_ID,
     create_topics_request::CreatableTopic,
     fetch_request::{FetchPartition, FetchTopic},
     record::{Record, inflated},
 };
-use tansu_storage::{ListOffsetRequest, ListOffsetResponse, Storage, StorageContainer, Topition};
+use tansu_storage::{FetchService, ListOffsetResponse, Storage, StorageContainer, Topition};
 use tracing::{debug, error};
 use url::Url;
 use uuid::Uuid;
 
 pub mod common;
 
-pub async fn empty_topic(cluster_id: Uuid, broker_id: i32, mut sc: StorageContainer) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+pub async fn empty_topic<C>(cluster_id: Uuid, broker_id: i32, sc: StorageContainer) -> Result<()>
+where
+    C: Into<String>,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -78,16 +82,19 @@ pub async fn empty_topic(cluster_id: Uuid, broker_id: i32, mut sc: StorageContai
                 .replica_directory_id(None),
         ]))];
 
-    let fetch: FetchResponse = FetchRequest::with_storage(sc.clone())
-        .response(
-            max_wait_ms,
-            min_bytes,
-            max_bytes,
-            Some(isolation_level.into()),
-            Some(&topics[..]),
+    let ctx = Context::with_state(sc);
+
+    let fetch = FetchService
+        .serve(
+            ctx,
+            FetchRequest::default()
+                .max_wait_ms(max_wait_ms)
+                .min_bytes(min_bytes)
+                .max_bytes(max_bytes)
+                .isolation_level(Some(isolation_level.into()))
+                .topics(Some(topics.into())),
         )
-        .await
-        .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
+        .await?;
 
     assert_eq!(
         ErrorCode::None,
@@ -133,12 +140,11 @@ pub async fn empty_topic(cluster_id: Uuid, broker_id: i32, mut sc: StorageContai
     Ok(())
 }
 
-pub async fn simple_non_txn(
-    cluster_id: Uuid,
-    broker_id: i32,
-    mut sc: StorageContainer,
-) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+pub async fn simple_non_txn<C>(cluster_id: C, broker_id: i32, sc: StorageContainer) -> Result<()>
+where
+    C: Into<String>,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -169,7 +175,7 @@ pub async fn simple_non_txn(
     let list_offsets = sc
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffsetRequest::Latest)],
+            &[(topition.clone(), ListOffset::Latest)],
         )
         .await
         .inspect_err(|err| error!(?err))
@@ -221,7 +227,7 @@ pub async fn simple_non_txn(
     let list_offsets = sc
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffsetRequest::Latest)],
+            &[(topition.clone(), ListOffset::Latest)],
         )
         .await
         .inspect_err(|err| error!(?err))
@@ -255,16 +261,19 @@ pub async fn simple_non_txn(
                 .replica_directory_id(None),
         ]))];
 
-    let fetch: FetchResponse = FetchRequest::with_storage(sc.clone())
-        .response(
-            max_wait_ms,
-            min_bytes,
-            max_bytes,
-            Some(isolation_level.into()),
-            Some(&topics[..]),
+    let ctx = Context::with_state(sc);
+
+    let fetch = FetchService
+        .serve(
+            ctx,
+            FetchRequest::default()
+                .max_wait_ms(max_wait_ms)
+                .min_bytes(min_bytes)
+                .max_bytes(max_bytes)
+                .isolation_level(Some(isolation_level.into()))
+                .topics(Some(topics.into())),
         )
-        .await
-        .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
+        .await?;
 
     assert_eq!(
         ErrorCode::None,
@@ -301,21 +310,19 @@ pub async fn simple_non_txn(
     Ok(())
 }
 
+#[cfg(feature = "postgres")]
 mod pg {
     use super::*;
 
-    fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
-        Url::parse("tcp://127.0.0.1/")
-            .map_err(Into::into)
-            .and_then(|advertised_listener| {
-                common::storage_container(
-                    StorageType::Postgres,
-                    cluster,
-                    node,
-                    advertised_listener,
-                    None,
-                )
-            })
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::Postgres,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -328,7 +335,7 @@ mod pg {
         super::simple_non_txn(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -343,7 +350,7 @@ mod pg {
         super::simple_non_txn(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -352,18 +359,15 @@ mod pg {
 mod in_memory {
     use super::*;
 
-    fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
-        Url::parse("tcp://127.0.0.1/")
-            .map_err(Into::into)
-            .and_then(|advertised_listener| {
-                common::storage_container(
-                    StorageType::InMemory,
-                    cluster,
-                    node,
-                    advertised_listener,
-                    None,
-                )
-            })
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::InMemory,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -376,7 +380,7 @@ mod in_memory {
         super::simple_non_txn(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -391,7 +395,53 @@ mod in_memory {
         super::simple_non_txn(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::Lite,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn empty_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_non_txn(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_non_txn() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_non_txn(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }

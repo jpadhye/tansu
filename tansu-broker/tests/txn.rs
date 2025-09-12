@@ -19,7 +19,7 @@ use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
 use rand::{prelude::*, rng};
 use tansu_broker::Result;
 use tansu_sans_io::{
-    BatchAttribute, ControlBatch, EndTransactionMarker, ErrorCode, IsolationLevel,
+    BatchAttribute, ControlBatch, EndTransactionMarker, ErrorCode, IsolationLevel, ListOffset,
     add_partitions_to_txn_request::AddPartitionsToTxnTopic,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
@@ -29,8 +29,7 @@ use tansu_sans_io::{
     txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
 };
 use tansu_storage::{
-    ListOffsetRequest, Storage, StorageContainer, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnOffsetCommitRequest,
+    Storage, StorageContainer, TopicId, Topition, TxnAddPartitionsRequest, TxnOffsetCommitRequest,
 };
 use tracing::{debug, error};
 use url::Url;
@@ -39,11 +38,11 @@ use uuid::Uuid;
 pub mod common;
 
 pub async fn simple_txn_commit_offset_commit(
-    cluster_id: Uuid,
+    cluster_id: impl Into<String>,
     broker_id: i32,
     mut sc: StorageContainer,
 ) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -162,11 +161,11 @@ pub async fn simple_txn_commit_offset_commit(
 }
 
 pub async fn simple_txn_commit_offset_abort(
-    cluster_id: Uuid,
+    cluster_id: impl Into<String>,
     broker_id: i32,
     mut sc: StorageContainer,
 ) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -285,11 +284,11 @@ pub async fn simple_txn_commit_offset_abort(
 }
 
 pub async fn simple_txn_produce_commit(
-    cluster_id: Uuid,
+    cluster_id: impl Into<String>,
     broker_id: i32,
     mut sc: StorageContainer,
 ) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -324,7 +323,7 @@ pub async fn simple_txn_produce_commit(
     let list_offsets_before = sc
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffsetRequest::Latest)],
+            &[(topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, list_offsets_before.len());
@@ -425,7 +424,7 @@ pub async fn simple_txn_produce_commit(
     };
 
     {
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
         let isolation_level = IsolationLevel::ReadUncommitted;
 
         let list_offsets_after = sc
@@ -452,7 +451,7 @@ pub async fn simple_txn_produce_commit(
     }
 
     {
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
         let isolation_level = IsolationLevel::ReadCommitted;
 
         let list_offsets_after = sc
@@ -503,7 +502,7 @@ pub async fn simple_txn_produce_commit(
 
     {
         let isolation_level = IsolationLevel::ReadUncommitted;
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
 
         let list_offsets_after = sc
             .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
@@ -534,7 +533,7 @@ pub async fn simple_txn_produce_commit(
         // txn 1 is committed
         //
         let isolation_level = IsolationLevel::ReadCommitted;
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
 
         let list_offsets_after = sc
             .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
@@ -569,11 +568,11 @@ pub async fn simple_txn_produce_commit(
 }
 
 pub async fn simple_txn_produce_abort(
-    cluster_id: Uuid,
+    cluster_id: impl Into<String>,
     broker_id: i32,
     mut sc: StorageContainer,
 ) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -608,7 +607,7 @@ pub async fn simple_txn_produce_abort(
     let list_offsets_before = sc
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffsetRequest::Latest)],
+            &[(topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, list_offsets_before.len());
@@ -709,7 +708,7 @@ pub async fn simple_txn_produce_abort(
     };
 
     {
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
         let isolation_level = IsolationLevel::ReadUncommitted;
 
         let list_offsets_after = sc
@@ -736,7 +735,7 @@ pub async fn simple_txn_produce_abort(
     }
 
     {
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
         let isolation_level = IsolationLevel::ReadCommitted;
 
         let list_offsets_after = sc
@@ -787,7 +786,7 @@ pub async fn simple_txn_produce_abort(
 
     {
         let isolation_level = IsolationLevel::ReadUncommitted;
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
 
         let list_offsets_after = sc
             .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
@@ -817,7 +816,7 @@ pub async fn simple_txn_produce_abort(
         // txn 1 is committed
         //
         let isolation_level = IsolationLevel::ReadCommitted;
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
 
         let list_offsets_after = sc
             .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
@@ -854,11 +853,11 @@ pub async fn simple_txn_produce_abort(
 // txns that overlap on the same topition
 //
 pub async fn with_overlap(
-    cluster_id: Uuid,
+    cluster_id: impl Into<String>,
     broker_id: i32,
     mut sc: StorageContainer,
 ) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -893,7 +892,7 @@ pub async fn with_overlap(
     let list_offsets_before = sc
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffsetRequest::Latest)],
+            &[(topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, list_offsets_before.len());
@@ -994,7 +993,7 @@ pub async fn with_overlap(
     };
 
     {
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
         let isolation_level = IsolationLevel::ReadUncommitted;
 
         let list_offsets_after = sc
@@ -1021,7 +1020,7 @@ pub async fn with_overlap(
     }
 
     {
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
         let isolation_level = IsolationLevel::ReadCommitted;
 
         let list_offsets_after = sc
@@ -1072,7 +1071,7 @@ pub async fn with_overlap(
 
     {
         let isolation_level = IsolationLevel::ReadUncommitted;
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
 
         let list_offsets_after = sc
             .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
@@ -1103,7 +1102,7 @@ pub async fn with_overlap(
         // txn 1 is committed, but isn't visible at read committed because it overlaps with txn 2
         //
         let isolation_level = IsolationLevel::ReadCommitted;
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
 
         let list_offsets_after = sc
             .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
@@ -1153,7 +1152,7 @@ pub async fn with_overlap(
 
     {
         let isolation_level = IsolationLevel::ReadUncommitted;
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
 
         let list_offsets_after = sc
             .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
@@ -1182,7 +1181,7 @@ pub async fn with_overlap(
 
     {
         let isolation_level = IsolationLevel::ReadCommitted;
-        let list_offset_type = ListOffsetRequest::Latest;
+        let list_offset_type = ListOffset::Latest;
 
         let list_offsets_after = sc
             .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
@@ -1218,11 +1217,11 @@ pub async fn with_overlap(
 }
 
 pub async fn init_producer_twice(
-    cluster_id: Uuid,
+    cluster_id: impl Into<String>,
     broker_id: i32,
     mut sc: StorageContainer,
 ) -> Result<()> {
-    register_broker(&cluster_id, broker_id, &mut sc).await?;
+    register_broker(cluster_id, broker_id, &mut sc).await?;
 
     let topic_name: String = alphanumeric_string(15);
     debug!(?topic_name);
@@ -1339,7 +1338,7 @@ pub async fn init_producer_twice(
         let list_offsets_after = sc
             .list_offsets(
                 IsolationLevel::ReadUncommitted,
-                &[(topition.clone(), ListOffsetRequest::Latest)],
+                &[(topition.clone(), ListOffset::Latest)],
             )
             .await
             .inspect_err(|err| error!(?err))?;
@@ -1356,7 +1355,7 @@ pub async fn init_producer_twice(
         let list_offsets_after = sc
             .list_offsets(
                 IsolationLevel::ReadCommitted,
-                &[(topition.clone(), ListOffsetRequest::Latest)],
+                &[(topition.clone(), ListOffset::Latest)],
             )
             .await
             .inspect_err(|err| error!(?err))?;
@@ -1385,7 +1384,7 @@ pub async fn init_producer_twice(
         let list_offsets = sc
             .list_offsets(
                 IsolationLevel::ReadUncommitted,
-                &[(topition.clone(), ListOffsetRequest::Latest)],
+                &[(topition.clone(), ListOffset::Latest)],
             )
             .await
             .inspect_err(|err| error!(?err))?;
@@ -1467,7 +1466,7 @@ pub async fn init_producer_twice(
         let list_offsets = sc
             .list_offsets(
                 IsolationLevel::ReadUncommitted,
-                &[(topition.clone(), ListOffsetRequest::Latest)],
+                &[(topition.clone(), ListOffset::Latest)],
             )
             .await
             .inspect_err(|err| error!(?err))?;
@@ -1532,21 +1531,19 @@ pub async fn init_producer_twice(
     Ok(())
 }
 
+#[cfg(feature = "postgres")]
 mod pg {
     use super::*;
 
-    fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
-        Url::parse("tcp://127.0.0.1/")
-            .map_err(Into::into)
-            .and_then(|advertised_listener| {
-                common::storage_container(
-                    StorageType::Postgres,
-                    cluster,
-                    node,
-                    advertised_listener,
-                    None,
-                )
-            })
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::Postgres,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1559,7 +1556,7 @@ mod pg {
         super::simple_txn_commit_offset_abort(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1574,7 +1571,7 @@ mod pg {
         super::simple_txn_commit_offset_commit(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1589,7 +1586,7 @@ mod pg {
         super::simple_txn_produce_commit(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1604,7 +1601,7 @@ mod pg {
         super::simple_txn_produce_abort(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1619,7 +1616,7 @@ mod pg {
         super::with_overlap(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1634,7 +1631,7 @@ mod pg {
         super::init_producer_twice(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1643,18 +1640,15 @@ mod pg {
 mod in_memory {
     use super::*;
 
-    fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
-        Url::parse("tcp://127.0.0.1/")
-            .map_err(Into::into)
-            .and_then(|advertised_listener| {
-                common::storage_container(
-                    StorageType::InMemory,
-                    cluster,
-                    node,
-                    advertised_listener,
-                    None,
-                )
-            })
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::InMemory,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1667,7 +1661,7 @@ mod in_memory {
         super::simple_txn_commit_offset_abort(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1682,7 +1676,7 @@ mod in_memory {
         super::simple_txn_commit_offset_commit(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1697,7 +1691,7 @@ mod in_memory {
         super::simple_txn_produce_commit(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1712,7 +1706,7 @@ mod in_memory {
         super::simple_txn_produce_abort(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1727,7 +1721,7 @@ mod in_memory {
         super::with_overlap(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }
@@ -1742,7 +1736,113 @@ mod in_memory {
         super::init_producer_twice(
             cluster_id,
             broker_id,
-            storage_container(cluster_id, broker_id)?,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "libsql")]
+mod lite {
+    use super::*;
+
+    async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<StorageContainer> {
+        common::storage_container(
+            StorageType::Lite,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_txn_commit_offset_abort() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_txn_commit_offset_abort(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_txn_commit_offset_commit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_txn_commit_offset_commit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_txn_produce_commit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_txn_produce_commit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_txn_produce_abort() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_txn_produce_abort(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn with_overlap() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::with_overlap(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn init_producer_twice() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::init_producer_twice(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
         )
         .await
     }

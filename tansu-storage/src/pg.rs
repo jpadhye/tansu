@@ -15,9 +15,8 @@
 //! PostgreSQL Storage engine
 
 use std::{
-    cmp::Ordering,
     collections::BTreeMap,
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::Hash,
     marker::PhantomData,
     str::FromStr,
     sync::LazyLock,
@@ -33,7 +32,7 @@ use rand::{prelude::*, rng};
 use serde_json::Value;
 use tansu_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, NULL_TOPIC_ID, OpType,
+    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -64,10 +63,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version,
+    sql::{default_hash, idempotent_sequence_check, remove_comments},
 };
 
 macro_rules! include_sql {
@@ -109,9 +109,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             lake: self.lake,
         }
     }
-}
 
-impl<C, N, L, P> Builder<C, N, L, P> {
     pub fn node(self, node: i32) -> Builder<C, i32, L, P> {
         Builder {
             cluster: self.cluster,
@@ -122,9 +120,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             lake: self.lake,
         }
     }
-}
 
-impl<C, N, L, P> Builder<C, N, L, P> {
     pub fn advertised_listener(self, advertised_listener: Url) -> Builder<C, N, Url, P> {
         Builder {
             cluster: self.cluster,
@@ -234,36 +230,8 @@ impl Postgres {
         self.pool.get().await.map_err(Into::into)
     }
 
-    fn idempotent_sequence_check(
-        producer_epoch: &i16,
-        sequence: &i32,
-        deflated: &deflated::Batch,
-    ) -> Result<i32> {
-        debug!(?producer_epoch, ?sequence, ?deflated);
-
-        match producer_epoch.cmp(&deflated.producer_epoch) {
-            Ordering::Equal => match sequence.cmp(&deflated.base_sequence) {
-                Ordering::Equal => Ok(deflated.last_offset_delta + 1),
-
-                Ordering::Greater => {
-                    debug!(?sequence, ?deflated.base_sequence);
-                    Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-                }
-
-                Ordering::Less => {
-                    debug!(?sequence, ?deflated.base_sequence);
-                    Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
-                }
-            },
-
-            Ordering::Greater => Err(Error::Api(ErrorCode::ProducerFenced)),
-
-            Ordering::Less => Err(Error::Api(ErrorCode::InvalidProducerEpoch)),
-        }
-    }
-
     async fn idempotent_message_check(
-        &mut self,
+        &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: &deflated::Batch,
@@ -319,7 +287,7 @@ impl Postgres {
                 sequence,
             );
 
-            let increment = Self::idempotent_sequence_check(&current_epoch, &sequence, deflated)?;
+            let increment = idempotent_sequence_check(&current_epoch, &sequence, deflated)?;
 
             debug!(increment);
 
@@ -348,7 +316,7 @@ impl Postgres {
     }
 
     async fn watermark_select_for_update(
-        &mut self,
+        &self,
         topition: &Topition,
         tx: &Transaction<'_>,
     ) -> Result<(Option<i64>, Option<i64>)> {
@@ -711,7 +679,7 @@ impl Postgres {
     }
 
     async fn produce_in_tx(
-        &mut self,
+        &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
@@ -736,10 +704,10 @@ impl Postgres {
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
-        if !attributes.control {
-            if let Some(ref schemas) = self.schemas {
-                schemas.validate(topition.topic(), &inflated).await?;
-            }
+        if !attributes.control
+            && let Some(ref schemas) = self.schemas
+        {
+            schemas.validate(topition.topic(), &inflated).await?;
         }
 
         let last_offset_delta = i64::from(inflated.last_offset_delta);
@@ -817,12 +785,13 @@ impl Postgres {
             }
         }
 
-        if let Some(transaction_id) = transaction_id {
-            if attributes.transaction {
-                let offset_start = high.unwrap_or_default();
-                let offset_end = high.map_or(last_offset_delta, |high| high + last_offset_delta);
+        if let Some(transaction_id) = transaction_id
+            && attributes.transaction
+        {
+            let offset_start = high.unwrap_or_default();
+            let offset_end = high.map_or(last_offset_delta, |high| high + last_offset_delta);
 
-                _ = self
+            _ = self
                     .tx_prepare_execute(tx,
                         include_sql!("pg/txn_produce_offset_insert.sql").as_str(),
                         &[
@@ -840,7 +809,6 @@ impl Postgres {
                     .await
                     .inspect(|n| debug!(cluster = ?self.cluster, ?transaction_id, ?inflated.producer_id, ?inflated.producer_epoch, ?topic, ?partition, ?offset_start, ?offset_end, ?n))
                     .inspect_err(|err| error!(?err))?;
-            }
         }
 
         _ = self
@@ -860,38 +828,35 @@ impl Postgres {
             .inspect(|n| debug!(?n))
             .inspect_err(|err| error!(?err))?;
 
-        if !attributes.control {
-            if let Some(ref registry) = self.schemas {
-                if let Some(ref lake) = self.lake {
-                    let lake_type = lake.lake_type().await?;
+        if !attributes.control
+            && let Some(ref registry) = self.schemas
+            && let Some(ref lake) = self.lake
+        {
+            let lake_type = lake.lake_type().await?;
 
-                    if let Some(record_batch) = registry.as_arrow(
-                        topition.topic(),
-                        topition.partition(),
-                        &inflated,
-                        lake_type,
-                    )? {
-                        let config = self
-                            .describe_config(topition.topic(), ConfigResource::Topic, None)
-                            .await?;
+            if let Some(record_batch) =
+                registry.as_arrow(topition.topic(), topition.partition(), &inflated, lake_type)?
+            {
+                let config = self
+                    .describe_config(topition.topic(), ConfigResource::Topic, None)
+                    .await?;
 
-                        lake.store(
-                            topition.topic(),
-                            topition.partition(),
-                            high.unwrap_or_default(),
-                            record_batch,
-                            config,
-                        )
-                        .await?;
-                    }
-                }
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    high.unwrap_or_default(),
+                    record_batch,
+                    config,
+                )
+                .await?;
             }
         }
+
         Ok(high.unwrap_or_default())
     }
 
     async fn end_in_tx(
-        &mut self,
+        &self,
         transaction_id: &str,
         producer_id: i64,
         producer_epoch: i16,
@@ -1155,10 +1120,7 @@ impl Postgres {
 
 #[async_trait]
 impl Storage for Postgres {
-    async fn register_broker(
-        &mut self,
-        broker_registration: BrokerRegistrationRequest,
-    ) -> Result<()> {
+    async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         debug!(cluster = self.cluster, ?broker_registration);
 
         let c = self.connection().await?;
@@ -1182,7 +1144,7 @@ impl Storage for Postgres {
         Ok(())
     }
 
-    async fn brokers(&mut self) -> Result<Vec<DescribeClusterBroker>> {
+    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
         debug!(cluster = self.cluster);
 
         let broker_id = self.node;
@@ -1203,11 +1165,13 @@ impl Storage for Postgres {
         ])
     }
 
-    async fn create_topic(&mut self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
+    async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
         debug!(cluster = self.cluster, ?topic, validate_only);
 
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
+
+        let uuid = Uuid::new_v4();
 
         let topic_uuid = self
             .tx_prepare_query_one(
@@ -1216,6 +1180,7 @@ impl Storage for Postgres {
                 &[
                     &self.cluster,
                     &topic.name,
+                    &uuid,
                     &topic.num_partitions,
                     &(topic.replication_factor as i32),
                 ],
@@ -1292,7 +1257,7 @@ impl Storage for Postgres {
     }
 
     async fn delete_records(
-        &mut self,
+        &self,
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(cluster = self.cluster, ?topics);
@@ -1419,7 +1384,7 @@ impl Storage for Postgres {
         Ok(responses)
     }
 
-    async fn delete_topic(&mut self, topic: &TopicId) -> Result<ErrorCode> {
+    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         debug!(cluster = self.cluster, ?topic);
 
         let mut c = self.connection().await?;
@@ -1530,7 +1495,7 @@ impl Storage for Postgres {
     }
 
     async fn incremental_alter_resource(
-        &mut self,
+        &self,
         resource: AlterConfigsResource,
     ) -> Result<AlterConfigsResourceResponse> {
         match ConfigResource::from(resource.resource_type) {
@@ -1620,7 +1585,7 @@ impl Storage for Postgres {
     }
 
     async fn produce(
-        &mut self,
+        &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
@@ -1641,7 +1606,7 @@ impl Storage for Postgres {
     }
 
     async fn fetch(
-        &mut self,
+        &self,
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
@@ -1769,7 +1734,7 @@ impl Storage for Postgres {
                     .inspect_err(|err| error!(?err))?;
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
-                let timestamp_delta = first
+                let timestamp_delta = record
                     .try_get::<_, SystemTime>(2)
                     .map_err(Error::from)
                     .and_then(|system_time| {
@@ -1850,7 +1815,7 @@ impl Storage for Postgres {
         Ok(batches)
     }
 
-    async fn offset_stage(&mut self, topition: &Topition) -> Result<OffsetStage> {
+    async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         debug!(cluster = self.cluster, ?topition);
         let c = self.connection().await?;
 
@@ -1889,7 +1854,7 @@ impl Storage for Postgres {
     }
 
     async fn offset_commit(
-        &mut self,
+        &self,
         group: &str,
         retention: Option<Duration>,
         offsets: &[(Topition, OffsetCommitRequest)],
@@ -1970,10 +1935,7 @@ impl Storage for Postgres {
         Ok(responses)
     }
 
-    async fn committed_offset_topitions(
-        &mut self,
-        group_id: &str,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
         debug!(group_id);
 
         let mut results = BTreeMap::new();
@@ -2006,7 +1968,7 @@ impl Storage for Postgres {
     }
 
     async fn offset_fetch(
-        &mut self,
+        &self,
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
@@ -2053,9 +2015,9 @@ impl Storage for Postgres {
     }
 
     async fn list_offsets(
-        &mut self,
+        &self,
         isolation_level: IsolationLevel,
-        offsets: &[(Topition, ListOffsetRequest)],
+        offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         debug!(cluster = self.cluster, ?isolation_level, ?offsets);
 
@@ -2065,14 +2027,14 @@ impl Storage for Postgres {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffsetRequest::Earliest, _) => include_sql!("pg/list_earliest_offset.sql"),
-                (ListOffsetRequest::Latest, IsolationLevel::ReadCommitted) => {
+                (ListOffset::Earliest, _) => include_sql!("pg/list_earliest_offset.sql"),
+                (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
                     include_sql!("pg/list_latest_offset_committed.sql")
                 }
-                (ListOffsetRequest::Latest, IsolationLevel::ReadUncommitted) => {
+                (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
                     include_sql!("pg/list_latest_offset_uncommitted.sql")
                 }
-                (ListOffsetRequest::Timestamp(_), _) => {
+                (ListOffset::Timestamp(_), _) => {
                     include_sql!("pg/list_latest_offset_timestamp.sql")
                 }
             };
@@ -2080,7 +2042,7 @@ impl Storage for Postgres {
             debug!(?query);
 
             let list_offset = match offset_type {
-                ListOffsetRequest::Earliest | ListOffsetRequest::Latest => self
+                ListOffset::Earliest | ListOffset::Latest => self
                     .prepare_query_opt(
                         &c,
                         query.as_str(),
@@ -2090,7 +2052,7 @@ impl Storage for Postgres {
                     .await
                     .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
 
-                ListOffsetRequest::Timestamp(timestamp) => self
+                ListOffset::Timestamp(timestamp) => self
                     .prepare_query_opt(
                         &c,
                         query.as_str(),
@@ -2156,7 +2118,7 @@ impl Storage for Postgres {
         Ok(responses).inspect(|r| debug!(?r))
     }
 
-    async fn metadata(&mut self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         debug!(cluster = self.cluster, ?topics);
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
@@ -2478,34 +2440,22 @@ impl Storage for Postgres {
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
         let prepared = c
-            .prepare(concat!(
-                "select topic.id",
-                " from cluster, topic",
-                " where cluster.name = $1",
-                " and topic.name = $2",
-                " and topic.cluster = cluster.id",
-            ))
+            .prepare(&include_sql!("pg/topic_select.sql"))
             .await
             .inspect_err(|err| error!(?err))?;
 
-        if let Some(row) = c
-            .query_opt(&prepared, &[&self.cluster.as_str(), &name])
+        if c.query_opt(&prepared, &[&self.cluster.as_str(), &name])
             .await
             .inspect_err(|err| error!(?err))?
+            .is_some()
         {
-            let id = row.try_get::<_, i32>(0).inspect_err(|err| error!(?err))?;
-
             let prepared = c
-                .prepare(concat!(
-                    "select name, value",
-                    " from topic_configuration",
-                    " where topic_configuration.topic = $1",
-                ))
+                .prepare(&include_sql!("pg/topic_configuration_select.sql"))
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let rows = c
-                .query(&prepared, &[&id])
+                .query(&prepared, &[&self.cluster.as_str(), &name])
                 .await
                 .inspect_err(|err| error!(?err))?;
 
@@ -2556,7 +2506,7 @@ impl Storage for Postgres {
     }
 
     async fn describe_topic_partitions(
-        &mut self,
+        &self,
         topics: Option<&[TopicId]>,
         partition_limit: i32,
         cursor: Option<Topition>,
@@ -2742,7 +2692,7 @@ impl Storage for Postgres {
         Ok(responses)
     }
 
-    async fn list_groups(&mut self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
         debug!(?states_filter);
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
@@ -2774,7 +2724,7 @@ impl Storage for Postgres {
     }
 
     async fn delete_groups(
-        &mut self,
+        &self,
         group_ids: Option<&[String]>,
     ) -> Result<Vec<DeletableGroupResult>> {
         debug!(?group_ids);
@@ -2834,7 +2784,7 @@ impl Storage for Postgres {
     }
 
     async fn describe_groups(
-        &mut self,
+        &self,
         group_ids: Option<&[String]>,
         include_authorized_operations: bool,
     ) -> Result<Vec<NamedGroupDetail>> {
@@ -2876,7 +2826,7 @@ impl Storage for Postgres {
     }
 
     async fn update_group(
-        &mut self,
+        &self,
         group_id: &str,
         detail: GroupDetail,
         version: Option<Version>,
@@ -2978,7 +2928,7 @@ impl Storage for Postgres {
     }
 
     async fn init_producer(
-        &mut self,
+        &self,
         transaction_id: Option<&str>,
         transaction_timeout_ms: i32,
         producer_id: Option<i64>,
@@ -3197,7 +3147,7 @@ impl Storage for Postgres {
     }
 
     async fn txn_add_offsets(
-        &mut self,
+        &self,
         transaction_id: &str,
         producer_id: i64,
         producer_epoch: i16,
@@ -3212,7 +3162,7 @@ impl Storage for Postgres {
     }
 
     async fn txn_add_partitions(
-        &mut self,
+        &self,
         partitions: TxnAddPartitionsRequest,
     ) -> Result<TxnAddPartitionsResponse> {
         debug!(cluster = self.cluster, ?partitions);
@@ -3309,7 +3259,7 @@ impl Storage for Postgres {
     }
 
     async fn txn_offset_commit(
-        &mut self,
+        &self,
         offsets: TxnOffsetCommitRequest,
     ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
         debug!(cluster = self.cluster, ?offsets);
@@ -3436,7 +3386,7 @@ impl Storage for Postgres {
     }
 
     async fn txn_end(
-        &mut self,
+        &self,
         transaction_id: &str,
         producer_id: i64,
         producer_epoch: i16,
@@ -3463,38 +3413,18 @@ impl Storage for Postgres {
             Ok(())
         }
     }
-}
 
-fn default_hash<H>(h: &H) -> Uuid
-where
-    H: Hash,
-{
-    let mut s = DefaultHasher::new();
-    h.hash(&mut s);
-    Uuid::from_u128(s.finish() as u128)
-}
+    fn cluster_id(&self) -> Result<&str> {
+        Ok(self.cluster.as_str())
+    }
 
-fn remove_comments(commented: &str) -> String {
-    commented.lines().fold(String::new(), |uncommented, line| {
-        if let Some(position) = line.find("--") {
-            match line.split_at(position) {
-                ("", _) => uncommented,
-                (before, _) => {
-                    if uncommented.is_empty() {
-                        before.trim().into()
-                    } else {
-                        format!("{uncommented} {before}")
-                    }
-                }
-            }
-        } else if line.trim().is_empty() {
-            uncommented
-        } else if uncommented.is_empty() {
-            line.trim().into()
-        } else {
-            format!("{uncommented} {}", line.trim())
-        }
-    })
+    fn node(&self) -> Result<i32> {
+        Ok(self.node)
+    }
+
+    fn advertised_listener(&self) -> Result<&Url> {
+        Ok(&self.advertised_listener)
+    }
 }
 
 static SQL_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
@@ -3518,55 +3448,3 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("The SQL error count")
         .build()
 });
-
-#[cfg(test)]
-mod tests {
-    use crate::{Error, Result};
-    use tracing::subscriber::DefaultGuard;
-    use tracing_subscriber::EnvFilter;
-
-    fn init_tracing() -> Result<DefaultGuard> {
-        use std::{fs::File, sync::Arc, thread};
-
-        Ok(tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_names(false)
-                .with_env_filter(EnvFilter::from_default_env().add_directive(
-                    format!("{}=debug", env!("CARGO_PKG_NAME").replace("-", "_")).parse()?,
-                ))
-                .with_writer(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .and_then(|name| {
-                            File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME"),))
-                                .map_err(Into::into)
-                        })
-                        .map(Arc::new)?,
-                )
-                .finish(),
-        ))
-    }
-
-    #[test]
-    fn remove_comments() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        assert_eq!(String::from(""), super::remove_comments(""));
-        assert_eq!(String::from("pqr"), super::remove_comments("-- abc\npqr"));
-        assert_eq!(String::from("abc"), super::remove_comments("abc -- def"));
-        assert_eq!(String::from("abc def"), super::remove_comments("abc\ndef"));
-        assert_eq!(
-            String::from("abc def"),
-            super::remove_comments("abc\n\ndef")
-        );
-        assert_eq!(
-            String::from("abc def"),
-            super::remove_comments("abc \ndef ")
-        );
-
-        Ok(())
-    }
-}

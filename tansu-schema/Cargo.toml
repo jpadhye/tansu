@@ -39,7 +39,6 @@ dotenv.workspace = true
 fake.workspace = true
 futures.workspace = true
 governor.workspace = true
-iceberg-catalog-memory.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 iceberg.workspace = true
@@ -70,6 +69,3 @@ uuid.workspace = true
 [dev-dependencies]
 pretty_assertions.workspace = true
 rand.workspace = true
-
-# [lints]
-# workspace = true
