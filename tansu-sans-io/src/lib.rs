@@ -121,7 +121,7 @@ pub mod primitive;
 pub mod record;
 pub mod ser;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
 pub use de::Decoder;
 use flate2::read::GzDecoder;
 use primitive::tagged::TagBuffer;
@@ -141,7 +141,7 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 use tansu_model::{MessageKind, MessageMeta};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, instrument, warn};
 use tracing_subscriber::filter::ParseError;
 
 /// The null topic identifier.
@@ -184,12 +184,12 @@ impl RootMessageMeta {
     }
 
     #[must_use]
-    pub fn requests(&self) -> &HashMap<i16, &'static MessageMeta> {
+    pub const fn requests(&self) -> &HashMap<i16, &'static MessageMeta> {
         &self.requests
     }
 
     #[must_use]
-    pub fn responses(&self) -> &HashMap<i16, &'static MessageMeta> {
+    pub const fn responses(&self) -> &HashMap<i16, &'static MessageMeta> {
         &self.responses
     }
 }
@@ -239,6 +239,7 @@ pub enum Error {
     TansuModel(tansu_model::Error),
     TryFromInt(#[from] num::TryFromIntError),
     TryFromSlice(#[from] TryFromSliceError),
+    TryGet(Arc<TryGetError>),
     UnexpectedType(String),
     UnknownApiErrorCode(i16),
     UnknownCompressionType(i16),
@@ -271,6 +272,12 @@ impl serde::de::Error for Error {
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::Io(Arc::new(value))
+    }
+}
+
+impl From<TryGetError> for Error {
+    fn from(value: TryGetError) -> Self {
+        Self::TryGet(Arc::new(value))
     }
 }
 
@@ -397,8 +404,17 @@ pub struct Frame {
 }
 
 impl Frame {
+    fn elapsed_millis(start: SystemTime) -> u64 {
+        start
+            .elapsed()
+            .map_or(0, |duration| duration.as_millis() as u64)
+    }
+
     /// serialize an API request into a frame of bytes
+    #[instrument(skip_all)]
     pub fn request(header: Header, body: Body) -> Result<Bytes> {
+        let start = SystemTime::now();
+
         let mut c = Cursor::new(vec![]);
 
         let mut serializer = Encoder::request(&mut c);
@@ -416,18 +432,30 @@ impl Frame {
         let buf = size.to_be_bytes();
         c.write_all(&buf)?;
 
-        Ok(Bytes::from(c.into_inner()))
+        Ok(Bytes::from(c.into_inner())).inspect(|encoded| {
+            debug!(
+                len = encoded.len(),
+                elapsed_millis = Self::elapsed_millis(start)
+            )
+        })
     }
 
     /// deserialize bytes into an API request frame
-    pub fn request_from_bytes(bytes: impl Buf) -> Result<Frame> {
-        let mut reader = bytes.reader();
+    #[instrument(skip_all)]
+    pub fn request_from_bytes(encoded: impl Buf) -> Result<Frame> {
+        let start = SystemTime::now();
+
+        let mut reader = encoded.reader();
         let mut deserializer = Decoder::request(&mut reader);
         Frame::deserialize(&mut deserializer)
+            .inspect(|_frame| debug!(elapsed_millis = Self::elapsed_millis(start)))
     }
 
     /// serialize an API response into a frame of bytes
+    #[instrument(skip_all)]
     pub fn response(header: Header, body: Body, api_key: i16, api_version: i16) -> Result<Bytes> {
+        let start = SystemTime::now();
+
         let mut c = Cursor::new(vec![]);
         let mut serializer = Encoder::response(&mut c, api_key, api_version);
 
@@ -449,14 +477,23 @@ impl Frame {
         let buf = size.to_be_bytes();
         c.write_all(&buf)?;
 
-        Ok(Bytes::from(c.into_inner()))
+        Ok(Bytes::from(c.into_inner())).inspect(|encoded| {
+            debug!(
+                len = encoded.len(),
+                elapsed_millis = Self::elapsed_millis(start)
+            )
+        })
     }
 
     /// deserialize bytes into an API response frame
+    #[instrument(skip_all)]
     pub fn response_from_bytes(bytes: impl Buf, api_key: i16, api_version: i16) -> Result<Frame> {
+        let start = SystemTime::now();
+
         let mut reader = bytes.reader();
         let mut deserializer = Decoder::response(&mut reader, api_key, api_version);
         Frame::deserialize(&mut deserializer)
+            .inspect(|encoded| debug!(elapsed_millis = Self::elapsed_millis(start)))
     }
 
     /// API request key
@@ -1367,7 +1404,9 @@ pub enum ErrorCode {
     InvalidRegistration,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
 /// The fetch isolation level.
 pub enum IsolationLevel {
     #[default]
@@ -1410,14 +1449,30 @@ pub enum Ack {
     FullIsr,
 }
 
+impl Ack {
+    const FULL_ISR: i16 = -1;
+    const NONE: i16 = 0;
+    const LEADER: i16 = 1;
+}
+
+impl From<Ack> for i16 {
+    fn from(value: Ack) -> Self {
+        match value {
+            Ack::FullIsr => Ack::FULL_ISR,
+            Ack::None => Ack::NONE,
+            Ack::Leader => Ack::LEADER,
+        }
+    }
+}
+
 impl TryFrom<i16> for Ack {
     type Error = Error;
 
     fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
-            -1 => Ok(Self::FullIsr),
-            0 => Ok(Self::None),
-            1 => Ok(Self::Leader),
+            Self::FULL_ISR => Ok(Self::FullIsr),
+            Self::NONE => Ok(Self::None),
+            Self::LEADER => Ok(Self::Leader),
             _ => Err(Error::InvalidAckValue(value)),
         }
     }
@@ -1962,7 +2017,7 @@ pub fn to_system_time(timestamp: i64) -> Result<SystemTime> {
 }
 
 /// convert system time into a kafka timestamp
-pub fn to_timestamp(system_time: SystemTime) -> Result<i64> {
+pub fn to_timestamp(system_time: &SystemTime) -> Result<i64> {
     system_time
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(Into::into)
@@ -1993,7 +2048,7 @@ impl TryFrom<ListOffset> for i64 {
         match value {
             ListOffset::Earliest => Ok(ListOffset::EARLIEST_OFFSET),
             ListOffset::Latest => Ok(ListOffset::LATEST_OFFSET),
-            ListOffset::Timestamp(timestamp) => to_timestamp(timestamp),
+            ListOffset::Timestamp(timestamp) => to_timestamp(&timestamp),
         }
     }
 }
@@ -2008,6 +2063,14 @@ impl TryFrom<i64> for ListOffset {
             timestamp => to_system_time(timestamp).map(Self::Timestamp),
         }
     }
+}
+
+pub trait Encode {
+    fn encode(&self) -> Result<Bytes>;
+}
+
+pub trait Decode: Sized {
+    fn decode(encoded: &mut Bytes) -> Result<Self>;
 }
 
 #[cfg(test)]

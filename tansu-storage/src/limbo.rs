@@ -173,9 +173,8 @@ pub struct Engine {
     node: i32,
     advertised_listener: Url,
     db: Arc<Mutex<Database>>,
-    #[allow(dead_code)]
+
     schemas: Option<Registry>,
-    #[allow(dead_code)]
     lake: Option<House>,
 }
 
@@ -607,27 +606,22 @@ impl Engine {
             .inspect_err(|err| error!(?err))?;
 
         if !attributes.control
-            && let Some(ref registry) = self.schemas
             && let Some(ref lake) = self.lake
         {
-            let lake_type = lake.lake_type().await?;
-
-            if let Some(record_batch) =
-                registry.as_arrow(topition.topic(), topition.partition(), &inflated, lake_type)?
-            {
-                let config = self
-                    .describe_config(topition.topic(), ConfigResource::Topic, None)
-                    .await?;
-
-                lake.store(
-                    topition.topic(),
-                    topition.partition(),
-                    high.unwrap_or_default(),
-                    record_batch,
-                    config,
-                )
+            let config = self
+                .describe_config(topition.topic(), ConfigResource::Topic, None)
                 .await?;
-            }
+
+            lake.store(
+                topition.topic(),
+                topition.partition(),
+                high.unwrap_or_default(),
+                &inflated,
+                config,
+            )
+            .await
+            .inspect(|store| debug!(?store))
+            .inspect_err(|err| debug!(?err))?;
         }
 
         Ok(high.unwrap_or_default())
@@ -1531,7 +1525,7 @@ impl Storage for Engine {
                     row.get_value(2)
                         .map_err(Error::from)
                         .and_then(LiteTimestamp::try_from)
-                        .and_then(|system_time| to_timestamp(system_time.0).map_err(Into::into))
+                        .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
                         .inspect_err(|err| error!(?err))?,
                 )
                 .producer_id(
@@ -1607,7 +1601,7 @@ impl Storage for Engine {
                                 .map_err(Error::from)
                                 .and_then(LiteTimestamp::try_from)
                                 .and_then(|system_time| {
-                                    to_timestamp(system_time.0).map_err(Into::into)
+                                    to_timestamp(&system_time.0).map_err(Into::into)
                                 })
                                 .inspect_err(|err| error!(?err))?,
                         )
@@ -1635,7 +1629,7 @@ impl Storage for Engine {
                     .map_err(Error::from)
                     .and_then(LiteTimestamp::try_from)
                     .and_then(|system_time| {
-                        to_timestamp(system_time.0)
+                        to_timestamp(&system_time.0)
                             .map(|timestamp| timestamp - batch_builder.base_timestamp)
                             .map_err(Into::into)
                     })
@@ -2828,7 +2822,7 @@ impl Storage for Engine {
                     .group_id(group_id)
                     .protocol_type("consumer".into())
                     .group_state(Some("unknown".into()))
-                    .group_type(None),
+                    .group_type(Some("classic".into())),
             );
         }
 
@@ -3636,16 +3630,16 @@ impl Storage for Engine {
         Ok(())
     }
 
-    fn cluster_id(&self) -> Result<&str> {
-        Ok(self.cluster.as_str())
+    async fn cluster_id(&self) -> Result<String> {
+        Ok(self.cluster.clone())
     }
 
-    fn node(&self) -> Result<i32> {
+    async fn node(&self) -> Result<i32> {
         Ok(self.node)
     }
 
-    fn advertised_listener(&self) -> Result<&Url> {
-        Ok(&self.advertised_listener)
+    async fn advertised_listener(&self) -> Result<Url> {
+        Ok(self.advertised_listener.clone())
     }
 }
 

@@ -10,6 +10,11 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[features]
+dynostore = ["dep:object_store"]
+libsql = ["dep:libsql"]
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
+turso = ["dep:turso"]
 
 [lints]
 workspace = true
@@ -43,6 +48,7 @@ tansu-service.workspace = true
 tansu-storage.workspace = true
 thiserror.workspace = true
 tokio-postgres = { workspace = true, optional = true }
+tokio-util.workspace = true
 tokio.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
@@ -53,10 +59,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-
-[features]
-default = ["dynostore", "libsql", "postgres"]
-dynostore = ["dep:object_store"]
-libsql = ["dep:libsql"]
-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
-turso = ["dep:turso"]
+tansu-schema = { workspace = true }
+tansu-storage = { workspace = true }
