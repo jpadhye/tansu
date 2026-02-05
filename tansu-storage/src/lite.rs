@@ -211,6 +211,8 @@ pub(crate) struct Delegate {
     schemas: Option<Registry>,
 
     lake: Option<House>,
+
+    vacuum_into: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1084,6 +1086,69 @@ impl Delegate {
 
         Ok(ErrorCode::None)
     }
+
+    #[instrument(skip(self), ret)]
+    async fn policy_compact(&self) -> Result<u64> {
+        let start = SystemTime::now();
+
+        let pc = self.connection().await?;
+        let tx = pc.transaction().await?;
+
+        let compacted = pc
+            .execute("policy_compact.sql", [self.cluster.as_str()])
+            .await? as u64;
+
+        tx.commit()
+            .await
+            .map_err(Into::into)
+            .and(Ok(compacted))
+            .inspect(|_| {
+                DELEGATE_REQUEST_DURATION.record(
+                    elapsed_millis(start),
+                    &[KeyValue::new("operation", "policy_compact")],
+                )
+            })
+    }
+
+    #[instrument(skip(self), ret)]
+    async fn vacuum_into(&self) -> Result<()> {
+        if let Some(vacuum_into) = self.vacuum_into.as_deref() {
+            let pc = self.connection().await?;
+            let rows = pc.execute("lite/vacuum_into.sql", [vacuum_into]).await? as u64;
+            debug!(vacuum_into, rows);
+        }
+
+        Ok(())
+    }
+
+    #[instrument(skip(self), ret)]
+    async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
+        let start = SystemTime::now();
+
+        let now = to_timestamp(&now)?;
+        let retention_ms = u64::try_from(Duration::from_hours(7 * 24).as_millis())?;
+
+        let pc = self.connection().await?;
+        let tx = pc.transaction().await?;
+
+        let deleted = pc
+            .execute(
+                "lite/policy_delete.sql",
+                (self.cluster.as_str(), now, retention_ms),
+            )
+            .await? as u64;
+
+        tx.commit()
+            .await
+            .map_err(Into::into)
+            .and(Ok(deleted))
+            .inspect(|_| {
+                DELEGATE_REQUEST_DURATION.record(
+                    elapsed_millis(start),
+                    &[KeyValue::new("operation", "policy_delete")],
+                )
+            })
+    }
 }
 
 #[derive(Clone, Default, Debug)]
@@ -1666,9 +1731,9 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn maintain(&self) -> Result<()> {
+    async fn maintain(&self, now: SystemTime) -> Result<()> {
         let start = SystemTime::now();
-        self.inner.maintain().await.inspect(|_| {
+        self.inner.maintain(now).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
                 &[KeyValue::new("operation", "maintain")],
@@ -1706,6 +1771,15 @@ impl Storage for Engine {
             )
         })
     }
+
+    #[instrument(skip_all)]
+    async fn ping(&self) -> Result<()> {
+        let start = SystemTime::now();
+        self.inner.ping().await.inspect(|_| {
+            ENGINE_REQUEST_DURATION
+                .record(elapsed_millis(start), &[KeyValue::new("operation", "ping")])
+        })
+    }
 }
 
 impl Builder<String, i32, Url, Url> {
@@ -1725,6 +1799,14 @@ impl Builder<String, i32, Url, Url> {
         }
 
         debug!(?path);
+
+        let vacuum_into = self.storage.query_pairs().find_map(|(k, v)| {
+            if k == "vacuum_into" {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        });
 
         let db = libsql::Builder::new_local(path).build().await?;
 
@@ -1754,6 +1836,7 @@ impl Builder<String, i32, Url, Url> {
                 .build()?,
                 schemas: self.schemas,
                 lake: self.lake,
+                vacuum_into,
             };
 
             server.spawn(async move {
@@ -2839,7 +2922,7 @@ impl Storage for Delegate {
                                                     .error_code(error_code)
                                                     .partition_index(partition_index)
                                                     .leader_id(leader_id)
-                                                    .leader_epoch(Some(-1))
+                                                    .leader_epoch(Some(0))
                                                     .replica_nodes(replica_nodes)
                                                     .isr_nodes(isr_nodes)
                                                     .offline_replicas(Some([].into()))
@@ -2933,7 +3016,7 @@ impl Storage for Delegate {
                                                     .error_code(error_code)
                                                     .partition_index(partition_index)
                                                     .leader_id(leader_id)
-                                                    .leader_epoch(Some(-1))
+                                                    .leader_epoch(Some(0))
                                                     .replica_nodes(replica_nodes)
                                                     .isr_nodes(isr_nodes)
                                                     .offline_replicas(Some([].into()))
@@ -3026,7 +3109,7 @@ impl Storage for Delegate {
                                     .error_code(error_code)
                                     .partition_index(partition_index)
                                     .leader_id(leader_id)
-                                    .leader_epoch(Some(-1))
+                                    .leader_epoch(Some(0))
                                     .replica_nodes(replica_nodes)
                                     .isr_nodes(isr_nodes)
                                     .offline_replicas(Some([].into()))
@@ -3200,7 +3283,7 @@ impl Storage for Delegate {
                                                 .error_code(ErrorCode::None.into())
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
-                                                .leader_epoch(-1)
+                                                .leader_epoch(0)
                                                 .replica_nodes(Some(vec![
                                                     self.node;
                                                     replication_factor
@@ -3291,7 +3374,7 @@ impl Storage for Delegate {
                                                 .error_code(ErrorCode::None.into())
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
-                                                .leader_epoch(-1)
+                                                .leader_epoch(0)
                                                 .replica_nodes(Some(vec![
                                                     self.node;
                                                     replication_factor
@@ -4125,13 +4208,21 @@ impl Storage for Delegate {
         })
     }
 
-    async fn maintain(&self) -> Result<()> {
+    async fn maintain(&self, now: SystemTime) -> Result<()> {
         let start = SystemTime::now();
+
+        let deleted = self.policy_delete(now).await?;
+        debug!(deleted);
+
+        let compacted = self.policy_compact().await?;
+        debug!(compacted);
+
+        self.vacuum_into().await?;
 
         {
             let connection = self.pool.get().await?;
 
-            let mut rows = connection.query("select freelist_count, page_size FROM pragma_freelist_count(), pragma_page_size()", ()).await?;
+            let mut rows = connection.query("maintain-vacuum.sql", ()).await?;
 
             if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
                 debug!(
@@ -4178,6 +4269,16 @@ impl Storage for Delegate {
                 &[KeyValue::new("operation", "advertised_listener")],
             )
         })
+    }
+
+    #[instrument(skip_all)]
+    async fn ping(&self) -> Result<()> {
+        let start = SystemTime::now();
+        let c = self.pool.get().await?;
+        let _ = c.query("ping.sql", ()).await?;
+        DELEGATE_REQUEST_DURATION
+            .record(elapsed_millis(start), &[KeyValue::new("operation", "ping")]);
+        Ok(())
     }
 }
 
@@ -4456,7 +4557,7 @@ mod tests {
             1,
             connection
                 .execute(
-                    &fix_parameters(&include_sql!("pg/register_broker.sql"))?,
+                    &fix_parameters(&include_sql!("sql/register_broker.sql"))?,
                     &[cluster]
                 )
                 .await?
@@ -4469,7 +4570,7 @@ mod tests {
 
         let mut rows = connection
             .query(
-                &fix_parameters(&include_sql!("pg/topic_insert.sql"))?,
+                &fix_parameters(&include_sql!("sql/topic_insert.sql"))?,
                 (
                     cluster,
                     name,
@@ -4507,7 +4608,7 @@ mod tests {
         assert_eq!(
             1,
             tx.execute(
-                &fix_parameters(&include_sql!("pg/register_broker.sql"))?,
+                &fix_parameters(&include_sql!("sql/register_broker.sql"))?,
                 &[cluster]
             )
             .await?
@@ -4520,7 +4621,7 @@ mod tests {
 
         let mut rows = tx
             .query(
-                &fix_parameters(&include_sql!("pg/topic_insert.sql"))?,
+                &fix_parameters(&include_sql!("sql/topic_insert.sql"))?,
                 (
                     cluster,
                     name,
@@ -4556,7 +4657,7 @@ mod tests {
         let name = "lite";
 
         _ = connection
-            .execute(&include_sql!("pg/register_broker.sql"), &[name])
+            .execute(&include_sql!("sql/register_broker.sql"), &[name])
             .await?;
 
         let mut rows = connection
